@@ -1,0 +1,9 @@
+target/
+saves/
+research/
+bench/
+bench_spot.json
+m5_spots/
+.git/
+.cuda-nvrtc/
+*.log

@@ -4508,6 +4508,56 @@ fn init_rayon() {
     println!("solver threads: {threads}");
 }
 
+/// Optional HTTP Basic Auth credentials, set once at startup from
+/// `GTOPEN_AUTH_USER` / `GTOPEN_AUTH_PASS`. `None` when either is unset or
+/// empty, which keeps local/loopback usage password-free by default.
+static AUTH_CREDENTIALS: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+
+fn init_auth() -> bool {
+    let user = std::env::var("GTOPEN_AUTH_USER").ok().filter(|s| !s.is_empty());
+    let pass = std::env::var("GTOPEN_AUTH_PASS").ok().filter(|s| !s.is_empty());
+    let creds = match (user, pass) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    };
+    let enabled = creds.is_some();
+    let _ = AUTH_CREDENTIALS.set(creds);
+    enabled
+}
+
+/// Gate every request behind HTTP Basic Auth when `GTOPEN_AUTH_USER` /
+/// `GTOPEN_AUTH_PASS` are set (e.g. for a non-loopback deployment like
+/// Railway, which otherwise exposes solves/saves/docs to anyone with the
+/// URL). A no-op when unset, so local desktop use is unaffected.
+async fn require_auth(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let Some(Some((user, pass))) = AUTH_CREDENTIALS.get() else {
+        return next.run(req).await;
+    };
+    let authorized = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|decoded| match decoded.split_once(':') {
+            Some((u, p)) => u == user && p == pass,
+            None => false,
+        })
+        .unwrap_or(false);
+    if authorized {
+        next.run(req).await
+    } else {
+        let mut res = axum::response::Response::new(axum::body::Body::from("Unauthorized"));
+        *res.status_mut() = StatusCode::UNAUTHORIZED;
+        res.headers_mut().insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Basic realm=\"GTOpen\""),
+        );
+        res
+    }
+}
+
 /// Resolve the HTTP listen address from `GTOPEN_HOST` (an IPv4/IPv6 literal,
 /// loopback by default) and `PORT`. Hostnames are rejected: resolving one can
 /// yield several addresses, and the loopback default already covers
@@ -4538,6 +4588,7 @@ fn browser_addr(mut addr: SocketAddr) -> SocketAddr {
 #[tokio::main]
 async fn main() {
     init_rayon();
+    let auth_enabled = init_auth();
     let state = Arc::new(AppState {
         session: Mutex::new(None),
         status: Mutex::new(StatusInfo {
@@ -4640,7 +4691,8 @@ async fn main() {
         .merge(multiway_api::routes())
         .fallback_service(serve_dir)
         .layer(axum::middleware::map_response(no_cache))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn(require_auth));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -4654,7 +4706,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    if !addr.ip().is_loopback() {
+    if !addr.ip().is_loopback() && !auth_enabled {
         eprintln!(
             "warning: listening on {addr} without authentication. Anyone who can reach \
              this port can run solves, change locks, write saves and read docs/ and research/."
